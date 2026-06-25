@@ -184,7 +184,7 @@ document.getElementById("reset-view").addEventListener("click", () => {
 
 const params = new URLSearchParams(location.search);
 const backend = params.get("backend") || location.host;
-const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+const protocol = params.get("protocol") || (location.protocol === "https:" ? "wss:" : "ws:");
 const wsUrl = params.get("ws") || `${protocol}//${backend}/ws`;
 const ws = new WebSocket(wsUrl);
 ws.binaryType = "arraybuffer";
