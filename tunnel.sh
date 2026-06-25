@@ -43,14 +43,16 @@ if [ "$TUNNEL" = "cloudflared" ]; then
   TUNNEL_PID=$!
   sleep 3
   echo "[!] Check cloudflared logs for the tunnel URL"
-  echo "    Then open: https://r-place-2.github.io?ws=wss://YOUR-TUNNEL.xyz/ws"
+  echo "    Then open (in browser):"
+  echo "    https://r-place-2.github.io/canvas.html?backend=YOUR-TUNNEL.xyz"
 else
   $TUNNEL local 3000 --to bore.pub &
   TUNNEL_PID=$!
   sleep 2
   # Try to extract the bore URL from the output
   echo "[!] Look for 'listening on bore.pub:XXXXX' above"
-  echo "    Then open:  https://r-place-2.github.io?backend=bore.pub:XXXXX"
+  echo "    Then open (in browser):"
+  echo "    https://r-place-2.github.io/canvas.html?backend=bore.pub:XXXXX&protocol=ws"
 fi
 
 cleanup() {
