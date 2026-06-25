@@ -1,0 +1,9 @@
+{
+  "name": "r-place-2",
+  "version": "1.0.0",
+  "private": true,
+  "description": "r/place clone - a collaborative pixel canvas",
+  "scripts": {
+    "start": "python3 server.py"
+  }
+}
