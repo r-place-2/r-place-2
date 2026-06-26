@@ -8,7 +8,7 @@ import os
 
 from aiohttp import web, WSMsgType
 
-PORT = 3000
+PORT = int(os.getenv("PORT", 3000))
 COOLDOWN_S = 300
 
 WIDTH = 500

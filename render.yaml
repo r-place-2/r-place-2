@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: r-place-2
+    runtime: python
+    repo: https://github.com/r-place-2/r-place-2
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 server.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
