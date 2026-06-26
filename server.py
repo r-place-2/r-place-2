@@ -23,6 +23,7 @@ ws_to_id = {}
 WS_CLIENTS = set()
 total_pixels_placed = 0
 db_pool = None
+LOCKED = False
 
 PALETTE_RGB = [
     (0xFF, 0xFF, 0xFF), (0xE4, 0xE4, 0xE4), (0x88, 0x88, 0x88), (0x22, 0x22, 0x22),
@@ -52,6 +53,16 @@ async def init_db():
                 width INTEGER NOT NULL,
                 height INTEGER NOT NULL,
                 data BYTEA NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS canvas_snapshots (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                data BYTEA NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
             )
         """)
         row = await conn.fetchrow(
@@ -96,14 +107,79 @@ async def save_canvas():
         pass
 
 
-def rle_encode():
+async def save_snapshot(name):
+    if not db_pool:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO canvas_snapshots (name, width, height, data) "
+                "VALUES ($1, $2, $3, $4)",
+                name, WIDTH, HEIGHT, bytes(canvas))
+        return True
+    except Exception:
+        return False
+
+
+async def get_snapshots():
+    if not db_pool:
+        return []
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, name, width, height, created_at "
+                "FROM canvas_snapshots ORDER BY created_at DESC")
+            return [
+                {"id": r["id"], "name": r["name"],
+                 "width": r["width"], "height": r["height"],
+                 "created_at": r["created_at"].strftime("%Y-%m-%d %H:%M") if r["created_at"] else ""}
+                for r in rows
+            ]
+    except Exception:
+        return []
+
+
+async def get_snapshot(id_):
+    if not db_pool:
+        return None
+    try:
+        async with db_pool.acquire() as conn:
+            return await conn.fetchrow(
+                "SELECT * FROM canvas_snapshots WHERE id = $1", id_)
+    except Exception:
+        return None
+
+
+async def delete_snapshot(id_):
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM canvas_snapshots WHERE id = $1", id_)
+    except Exception:
+        pass
+
+
+async def broadcast_lock_status():
+    msg = struct.pack(">BB", 3, 1 if LOCKED else 0)
+    dead = set()
+    for c in WS_CLIENTS:
+        try:
+            await c.send_bytes(msg)
+        except (ConnectionResetError, ConnectionAbortedError):
+            dead.add(c)
+    WS_CLIENTS -= dead
+
+
+def rle_encode(data, w, h):
     buf = bytearray()
     i = 0
-    total = WIDTH * HEIGHT
+    total = w * h
     while i < total:
-        val = canvas[i]
+        val = data[i]
         count = 1
-        while i + count < total and count < 256 and canvas[i + count] == val:
+        while i + count < total and count < 256 and data[i + count] == val:
             count += 1
         buf.append(count - 1)
         buf.append(val)
@@ -112,7 +188,7 @@ def rle_encode():
 
 
 def build_init_msg():
-    return struct.pack(">BHH", 0, WIDTH, HEIGHT) + rle_encode()
+    return struct.pack(">BHH", 0, WIDTH, HEIGHT) + rle_encode(canvas, WIDTH, HEIGHT)
 
 
 def resize_canvas(direction, amount):
@@ -186,7 +262,7 @@ LOGIN_FORM = (
 
 
 async def admin_handler(request):
-    global WS_CLIENTS, WIDTH, HEIGHT
+    global WS_CLIENTS, WIDTH, HEIGHT, LOCKED
     if not check_admin(request):
         if request.method == "POST":
             data = await request.post()
@@ -209,6 +285,7 @@ async def admin_handler(request):
     if request.method == "POST":
         data = await request.post()
         action = data.get("action")
+
         if action == "clear":
             canvas[:] = bytearray(WIDTH * HEIGHT)
             await save_canvas()
@@ -220,6 +297,7 @@ async def admin_handler(request):
                     dead.add(c)
             WS_CLIENTS -= dead
             return web.HTTPFound("/admin")
+
         if action == "resize":
             direction = data.get("dir", "")
             try:
@@ -238,6 +316,27 @@ async def admin_handler(request):
                 WS_CLIENTS -= dead
             return web.HTTPFound("/admin")
 
+        if action == "lock":
+            LOCKED = data.get("state") == "1"
+            await broadcast_lock_status()
+            print(f"[Admin] Canvas {'locked' if LOCKED else 'unlocked'}")
+            return web.HTTPFound("/admin")
+
+        if action == "snapshot":
+            name = data.get("name", "").strip()
+            ok = await save_snapshot(name)
+            if ok:
+                print(f"[Admin] Snapshot saved: {name or 'unnamed'}")
+            return web.HTTPFound("/admin")
+
+        if action == "del_snapshot":
+            try:
+                sid = int(data.get("id", 0))
+                await delete_snapshot(sid)
+            except ValueError:
+                pass
+            return web.HTTPFound("/admin")
+
     color_counts = {}
     for idx in canvas:
         color_counts[idx] = color_counts.get(idx, 0) + 1
@@ -250,6 +349,29 @@ async def admin_handler(request):
         for idx, count in sorted(color_counts.items(), key=lambda x: -x[1])
     )
 
+    snapshots = await get_snapshots()
+    snap_rows = "".join(
+        f"<tr>"
+        f"<td>{s['name'] or '—'}</td>"
+        f"<td>{s['width']}&times;{s['height']}</td>"
+        f"<td>{s['created_at']}</td>"
+        f"<td><a href='/snapshot/{s['id']}' target=_blank>View</a></td>"
+        f"<td>"
+        f"<form method=post action=/admin style='display:inline'>"
+        f"<input type=hidden name=action value=del_snapshot>"
+        f"<input type=hidden name=id value={s['id']}>"
+        f"<button style='background:#500;color:#f88;border:none;border-radius:3px;padding:2px 8px;cursor:pointer'>Del</button>"
+        f"</form>"
+        f"</td>"
+        f"</tr>"
+        for s in snapshots
+    )
+
+    lock_label = "Unlocked" if not LOCKED else "Locked"
+    lock_color = "#4caf50" if not LOCKED else "#f44336"
+    lock_btn = "Lock" if not LOCKED else "Unlock"
+    lock_state = "1" if not LOCKED else "0"
+
     return web.Response(
         content_type="text/html",
         text=f"""<!DOCTYPE html>
@@ -259,7 +381,7 @@ async def admin_handler(request):
 <title>r/place 2 – Admin</title>
 <style>
 body{{font-family:system-ui,sans-serif;background:#111;color:#eee;padding:20px}}
-h1{{color:#fff}}
+h1,h2{{color:#fff}}
 table{{border-collapse:collapse}}
 td,th{{padding:6px 12px;text-align:left;border-bottom:1px solid #333}}
 th{{color:#888;text-transform:uppercase;font-size:12px;letter-spacing:1px}}
@@ -270,10 +392,14 @@ th{{color:#888;text-transform:uppercase;font-size:12px;letter-spacing:1px}}
 .resize-input{{width:60px;padding:6px;background:#222;color:#eee;border:1px solid #555;border-radius:4px}}
 .resize-btn{{padding:6px 14px;background:#333;color:#eee;border:1px solid #777;border-radius:4px;cursor:pointer}}
 .resize-btn:hover{{background:#444}}
+.section{{border:1px solid #333;border-radius:6px;padding:16px;margin-bottom:20px}}
+.section h2{{margin-top:0}}
+input[type=text]{{padding:6px 10px;background:#222;color:#eee;border:1px solid #555;border-radius:4px}}
 </style>
 </head>
 <body>
 <h1>r/place 2 – Admin</h1>
+
 <div class="grid">
   <div><div class="stat">{len(WS_CLIENTS)}</div><div class="stat-label">Active</div></div>
   <div><div class="stat">{total_pixels_placed}</div><div class="stat-label">Pixels Placed</div></div>
@@ -281,27 +407,132 @@ th{{color:#888;text-transform:uppercase;font-size:12px;letter-spacing:1px}}
   <div><div class="stat">{COOLDOWN_S}s</div><div class="stat-label">Cooldown</div></div>
   <div><div class="stat">{WIDTH}&times;{HEIGHT}</div><div class="stat-label">Size</div></div>
   <div><div class="stat">{len(canvas)}</div><div class="stat-label">Canvas Bytes</div></div>
+  <div><div class="stat" style="color:{lock_color}">{lock_label}</div><div class="stat-label">Status</div></div>
 </div>
-<form method="post" action="/admin" onsubmit="return confirm('Clear entire canvas?')">
-  <input type="hidden" name="action" value="clear">
-  <button class="danger">Clear Canvas</button>
-</form>
-<h2>Resize</h2>
-<form method="post" action="/admin" style="margin-bottom:20px">
-  <input type="hidden" name="action" value="resize">
-  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-    <input class="resize-input" type="number" name="amount" min="1" max="200" value="10">
-    <button class="resize-btn" type="submit" name="dir" value="up">Up</button>
-    <button class="resize-btn" type="submit" name="dir" value="down">Down</button>
-    <button class="resize-btn" type="submit" name="dir" value="left">Left</button>
-    <button class="resize-btn" type="submit" name="dir" value="right">Right</button>
-    <span style="color:#888;font-size:13px">px</span>
-  </div>
-</form>
+
+<div class="section">
+  <h2>Canvas Lock</h2>
+  <form method=post action=/admin>
+    <input type=hidden name=action value=lock>
+    <input type=hidden name=state value={lock_state}>
+    <button style="padding:8px 24px;background:{'#f44336' if not LOCKED else '#4caf50'};color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:16px">{lock_btn}</button>
+  </form>
+</div>
+
+<div style="display:flex;gap:20px;flex-wrap:wrap">
+
+<div class="section" style="flex:1;min-width:300px">
+  <h2>Danger Zone</h2>
+  <form method="post" action="/admin" onsubmit="return confirm('Clear entire canvas?')">
+    <input type="hidden" name="action" value="clear">
+    <button class="danger">Clear Canvas</button>
+  </form>
+</div>
+
+<div class="section" style="flex:1;min-width:300px">
+  <h2>Resize</h2>
+  <form method="post" action="/admin">
+    <input type="hidden" name="action" value="resize">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input class="resize-input" type="number" name="amount" min="1" max="200" value="10">
+      <button class="resize-btn" type="submit" name="dir" value="up">Up</button>
+      <button class="resize-btn" type="submit" name="dir" value="down">Down</button>
+      <button class="resize-btn" type="submit" name="dir" value="left">Left</button>
+      <button class="resize-btn" type="submit" name="dir" value="right">Right</button>
+      <span style="color:#888;font-size:13px">px</span>
+    </div>
+  </form>
+</div>
+
+<div class="section" style="flex:1;min-width:300px">
+  <h2>Save Snapshot</h2>
+  <form method=post action=/admin>
+    <input type=hidden name=action value=snapshot>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input type=text name=name placeholder="Snapshot name (optional)">
+      <button style="padding:6px 16px;background:#333;color:#eee;border:1px solid #777;border-radius:4px;cursor:pointer">Save</button>
+    </div>
+  </form>
+  <p style="color:#888;font-size:13px">Snapshots survive clear. Viewable at /snapshot/ID.</p>
+</div>
+
+</div>
+
 <h2>Pixel Distribution</h2>
 <table><tr><th>Color</th><th>Hex</th><th>Count</th><th>%</th></tr>{rows}</table>
+
+<h2>Snapshots</h2>
+<table>
+<tr><th>Name</th><th>Size</th><th>Date</th><th></th><th></th></tr>
+{snap_rows if snap_rows else '<tr><td colspan=5 style="color:#666">No snapshots yet</td></tr>'}
+</table>
+
 </body>
 </html>""")
+
+
+async def snapshot_viewer(request):
+    try:
+        sid = int(request.match_info.get("id", 0))
+    except ValueError:
+        raise web.HTTPNotFound()
+    snap = await get_snapshot(sid)
+    if not snap:
+        raise web.HTTPNotFound()
+
+    sw, sh = snap["width"], snap["height"]
+    rle_data = rle_encode(snap["data"], sw, sh)
+
+    import base64
+    b64 = base64.b64encode(rle_data).decode()
+
+    palette_json = "[" + ",".join(
+        f'["#{r:02X}{g:02X}{b:02X}"]' for r, g, b in PALETTE_RGB
+    ) + "]"
+
+    name = snap["name"] or f"Snapshot #{sid}"
+
+    return web.Response(
+        content_type="text/html",
+        text=f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{name} – r/place 2</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#111;color:#eee;font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;padding:20px;min-height:100vh}}
+h1{{font-size:18px;margin-bottom:8px}}
+.info{{color:#888;font-size:13px;margin-bottom:20px}}
+#wrap{{overflow:auto;max-width:100%}}
+canvas{{image-rendering:pixelated}}
+.back{{color:#0083C7;text-decoration:none;margin-bottom:16px;display:inline-block}}
+.back:hover{{text-decoration:underline}}
+</style>
+</head>
+<body>
+<a class=back href='/admin'>&larr; Back to Admin</a>
+<h1>{name}</h1>
+<div class=info>{sw}&times;{sh} &middot; Read-only snapshot</div>
+<div id=wrap><canvas id=c></canvas></div>
+<script>
+const PALETTE = {palette_json};
+const W={sw},H={sh};
+const rle=Uint8Array.from(atob("{b64}"),c=>c.charCodeAt(0));
+function decodeRLE(data){{const out=[];let off=0;while(off<data.length){{const n=data[off]+1,idx=data[off+1];for(let k=0;k<n;k++)out.push(idx);off+=2}}return new Uint8Array(out)}}
+const pixels=decodeRLE(rle);
+const el=document.getElementById("c");
+el.width=W;el.height=H;
+const ctx=el.getContext("2d");
+const img=ctx.createImageData(W,H);
+const d=img.data;
+for(let i=0,j=0;i<pixels.length;i++,j+=4){{const[r,g,b]=PALETTE[pixels[i]];d[j]=parseInt(r.slice(1,3),16);d[j+1]=parseInt(g.slice(1,3),16);d[j+2]=parseInt(b.slice(1,3),16);d[j+3]=255}}
+ctx.putImageData(img,0,0);
+</script>
+</body>
+</html>"""
+    )
 
 
 async def websocket_handler(request):
@@ -316,6 +547,7 @@ async def websocket_handler(request):
 
     try:
         await ws.send_bytes(build_init_msg())
+        await ws.send_bytes(struct.pack(">BB", 3, 1 if LOCKED else 0))
 
         async for msg in ws:
             try:
@@ -332,6 +564,10 @@ async def websocket_handler(request):
                     continue
 
                 if mt != 1 or len(data) < 8:
+                    continue
+
+                if LOCKED and not is_admin:
+                    await ws.send_bytes(struct.pack(">BI", 2, 0))
                     continue
 
                 x = (data[1] << 16) | (data[2] << 8) | data[3]
@@ -391,6 +627,7 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "public")
 app = web.Application()
 app.router.add_get("/", index)
 app.router.add_route("*", "/admin", admin_handler)
+app.router.add_get("/snapshot/{id}", snapshot_viewer)
 app.router.add_static("/", STATIC_DIR)
 app.router.add_get("/ws", websocket_handler)
 

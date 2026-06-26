@@ -25,6 +25,7 @@ body {
 #status { font-size: 13px; color: #888; }
 #status.online { color: #4caf50; }
 #status.offline { color: #f44336; }
+#status.locked { color: #ff9800; }
 
 #cooldown { font-size: 13px; color: #ff9800; margin-left: auto; }
 #coord { font-size: 13px; color: #888; }
@@ -67,6 +68,7 @@ body {
   gap: 4px;
 }
 
+.locked #palette button { opacity: 0.4; pointer-events: none; }
 #palette button {
   width: 28px;
   height: 28px;

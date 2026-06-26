@@ -28,6 +28,7 @@ let selectedIdx = 0;
 let cooldownUntil = 0;
 let pendingPixel = null;
 let needsRedraw = false;
+let locked = false;
 
 const CLIENT_ID_KEY = "rplace2_client_id";
 let clientId = localStorage.getItem(CLIENT_ID_KEY);
@@ -139,6 +140,7 @@ canvasEl.addEventListener("mousedown", (e) => {
 
   if (x < 0 || x >= W || y < 0 || y >= H) return;
   if (!pixels) return;
+  if (locked) return;
   if (Date.now() < cooldownUntil) return;
 
   const pos = y * W + x;
@@ -235,9 +237,17 @@ ws.onmessage = (e) => {
       requestRender();
     }
     const ms = (buf[1] << 24) | (buf[2] << 16) | (buf[3] << 8) | buf[4];
+    if (ms === 0 && locked) return;
     cooldownUntil = Date.now() + ms;
     cooldownEl.textContent = "";
     tickCooldown();
+  }
+
+  if (type === 3) {
+    locked = buf[1] === 1;
+    document.body.classList.toggle("locked", locked);
+    statusEl.textContent = locked ? "Locked" : "Online";
+    statusEl.className = locked ? "locked" : "online";
   }
 };
 
