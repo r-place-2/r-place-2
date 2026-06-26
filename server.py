@@ -162,12 +162,13 @@ async def delete_snapshot(id_):
 
 
 async def broadcast_lock_status():
+    global WS_CLIENTS
     msg = struct.pack(">BB", 3, 1 if LOCKED else 0)
     dead = set()
-    for c in WS_CLIENTS:
+    for c in list(WS_CLIENTS):
         try:
             await c.send_bytes(msg)
-        except (ConnectionResetError, ConnectionAbortedError):
+        except Exception:
             dead.add(c)
     WS_CLIENTS -= dead
 
@@ -290,10 +291,10 @@ async def admin_handler(request):
             canvas[:] = bytearray(WIDTH * HEIGHT)
             await save_canvas()
             dead = set()
-            for c in WS_CLIENTS:
+            for c in list(WS_CLIENTS):
                 try:
                     await c.send_bytes(build_init_msg())
-                except (ConnectionResetError, ConnectionAbortedError):
+                except Exception:
                     dead.add(c)
             WS_CLIENTS -= dead
             return web.HTTPFound("/admin")
@@ -308,10 +309,10 @@ async def admin_handler(request):
                 resize_canvas(direction, amount)
                 await save_canvas()
                 dead = set()
-                for c in WS_CLIENTS:
+                for c in list(WS_CLIENTS):
                     try:
                         await c.send_bytes(build_init_msg())
-                    except (ConnectionResetError, ConnectionAbortedError):
+                    except Exception:
                         dead.add(c)
                 WS_CLIENTS -= dead
             return web.HTTPFound("/admin")
@@ -607,10 +608,10 @@ async def websocket_handler(request):
                 ])
 
                 dead = set()
-                for c in WS_CLIENTS:
+                for c in list(WS_CLIENTS):
                     try:
                         await c.send_bytes(pixel_msg)
-                    except (ConnectionResetError, ConnectionAbortedError):
+                    except Exception:
                         dead.add(c)
                 WS_CLIENTS -= dead
             except Exception:
