@@ -6,10 +6,13 @@ import struct
 import time
 import os
 
+import asyncpg
+
 from aiohttp import web, WSMsgType
 
 PORT = int(os.getenv("PORT", 3000))
 COOLDOWN_S = 300
+DB_URL = os.getenv("DATABASE_URL")
 
 WIDTH = 500
 HEIGHT = 500
@@ -19,6 +22,7 @@ client_cooldowns = {}
 ws_to_id = {}
 WS_CLIENTS = set()
 total_pixels_placed = 0
+db_pool = None
 
 PALETTE_RGB = [
     (0xFF, 0xFF, 0xFF), (0xE4, 0xE4, 0xE4), (0x88, 0x88, 0x88), (0x22, 0x22, 0x22),
@@ -29,6 +33,67 @@ PALETTE_RGB = [
 ]
 
 PALETTE_HEX = [f"#{r:02X}{g:02X}{b:02X}" for r, g, b in PALETTE_RGB]
+
+
+async def init_db():
+    global db_pool, WIDTH, HEIGHT, canvas
+    if not DB_URL:
+        print("[DB] No DATABASE_URL set – running in-memory only")
+        return
+    try:
+        db_pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=2)
+    except Exception as e:
+        print(f"[DB] Connection failed ({e}) – running in-memory only")
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS canvas_state (
+                id INTEGER PRIMARY KEY,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                data BYTEA NOT NULL
+            )
+        """)
+        row = await conn.fetchrow(
+            "SELECT width, height, data FROM canvas_state WHERE id = 1")
+        if row:
+            WIDTH = row["width"]
+            HEIGHT = row["height"]
+            canvas = bytearray(row["data"])
+            print(f"[DB] Loaded canvas {WIDTH}x{HEIGHT}")
+        else:
+            await conn.execute(
+                "INSERT INTO canvas_state (id, width, height, data) "
+                "VALUES (1, $1, $2, $3)",
+                WIDTH, HEIGHT, bytes(canvas))
+            print("[DB] Created new canvas")
+
+
+async def save_pixel(pos, idx):
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE canvas_state SET data = "
+                "overlay(data placing $1::bytea from $2 for 1) "
+                "WHERE id = 1",
+                bytes([idx]), pos + 1)
+    except Exception:
+        pass
+
+
+async def save_canvas():
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE canvas_state SET width=$1, height=$2, data=$3 "
+                "WHERE id = 1",
+                WIDTH, HEIGHT, bytes(canvas))
+    except Exception:
+        pass
 
 
 def rle_encode():
@@ -146,6 +211,7 @@ async def admin_handler(request):
         action = data.get("action")
         if action == "clear":
             canvas[:] = bytearray(WIDTH * HEIGHT)
+            await save_canvas()
             dead = set()
             for c in WS_CLIENTS:
                 try:
@@ -162,6 +228,7 @@ async def admin_handler(request):
                 amount = 0
             if direction in ("up", "down", "left", "right") and 1 <= amount <= 200:
                 resize_canvas(direction, amount)
+                await save_canvas()
                 dead = set()
                 for c in WS_CLIENTS:
                     try:
@@ -290,7 +357,9 @@ async def websocket_handler(request):
                     client_cooldowns[key] = now
 
                 total_pixels_placed += 1
-                canvas[y * WIDTH + x] = palette_idx
+                pos = y * WIDTH + x
+                canvas[pos] = palette_idx
+                asyncio.ensure_future(save_pixel(pos, palette_idx))
                 print(f"[.] {addr} pixel {x},{y} idx={palette_idx}"
                       f"{' [admin]' if is_admin else ''}")
 
@@ -324,6 +393,11 @@ app.router.add_get("/", index)
 app.router.add_route("*", "/admin", admin_handler)
 app.router.add_static("/", STATIC_DIR)
 app.router.add_get("/ws", websocket_handler)
+
+async def on_startup(app):
+    await init_db()
+
+app.on_startup.append(on_startup)
 
 if __name__ == "__main__":
     print(f"r/place 2 running at http://localhost:{PORT}")
