@@ -17,7 +17,7 @@ Collaborative pixel canvas inspired by Reddit's r/place.
   - Statistics
 - Palette-indexed storage (1 byte/pixel, very memory efficient)
 
-## Quick Start
+## Local Start
 
 ```bash
 pip install aiohttp websockets
@@ -28,7 +28,7 @@ Open http://localhost:3000
 
 ## Admin
 
-Visit http://localhost:3000/admin and enter password `Ben2013`.
+Visit r-place-2.github.io and enter the password .
 
 Once logged in, place pixels without cooldown and access the admin panel.
 
@@ -45,6 +45,10 @@ curl -sL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x8
 ```
 
 This gives you a public URL like `bore.pub:12345`. Update the WebSocket URL in the frontend to point to this address.
+
+### !IMPORTANT!
+
+### Since the 26/06/2026 or 06/26/2026 This method is not used anymore and is instead running on a Render Free Plan
 
 ## Protocol
 
