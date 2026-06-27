@@ -61,6 +61,15 @@ async def connect_db(url):
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS backup_history (
+                    id SERIAL PRIMARY KEY,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    data BYTEA NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
         return pool
     except Exception as e:
         if pool:
@@ -125,6 +134,8 @@ async def init_db():
 
 
 async def backup_loop():
+    MAX_BACKUPS = 5000
+    TRIM_TO = 4000
     while True:
         await asyncio.sleep(600)
         if not backup_pool:
@@ -132,10 +143,20 @@ async def backup_loop():
         try:
             async with backup_pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE canvas_state SET width=$1, height=$2, data=$3 "
-                    "WHERE id = 1",
+                    "INSERT INTO backup_history (width, height, data) "
+                    "VALUES ($1, $2, $3)",
                     WIDTH, HEIGHT, bytes(canvas))
-            print("[Backup] Canvas saved to backup DB")
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM backup_history")
+                if count > MAX_BACKUPS:
+                    await conn.execute(
+                        "DELETE FROM backup_history WHERE id IN ("
+                        "SELECT id FROM backup_history "
+                        "ORDER BY id ASC LIMIT $1)",
+                        count - TRIM_TO)
+                    removed = count - TRIM_TO
+                    print(f"[Backup] Trimmed {removed} old backups")
+            print(f"[Backup] Saved (total: {min(count, MAX_BACKUPS)})")
         except Exception as e:
             print(f"[Backup] Failed: {e}")
 
