@@ -13,6 +13,7 @@ from aiohttp import web, WSMsgType
 PORT = int(os.getenv("PORT", 3000))
 COOLDOWN_S = 300
 DB_URL = os.getenv("DATABASE_URL")
+BACKUP_DB_URL = os.getenv("BACKUP_DB_URL")
 
 WIDTH = 500
 HEIGHT = 500
@@ -23,6 +24,7 @@ ws_to_id = {}
 WS_CLIENTS = set()
 total_pixels_placed = 0
 db_pool = None
+backup_pool = None
 LOCKED = False
 
 PALETTE_RGB = [
@@ -36,35 +38,77 @@ PALETTE_RGB = [
 PALETTE_HEX = [f"#{r:02X}{g:02X}{b:02X}" for r, g, b in PALETTE_RGB]
 
 
-async def init_db():
-    global db_pool, WIDTH, HEIGHT, canvas
-    if not DB_URL:
-        print("[DB] No DATABASE_URL set – running in-memory only")
-        return
+async def connect_db(url):
+    pool = None
     try:
-        db_pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=2)
+        pool = await asyncpg.create_pool(url, min_size=1, max_size=2)
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS canvas_state (
+                    id INTEGER PRIMARY KEY,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    data BYTEA NOT NULL
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS canvas_snapshots (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    data BYTEA NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+        return pool
     except Exception as e:
-        print(f"[DB] Connection failed ({e}) – running in-memory only")
+        if pool:
+            await pool.close()
+        raise e
+
+
+async def init_db():
+    global db_pool, backup_pool, WIDTH, HEIGHT, canvas
+    primary_url = DB_URL
+    fallback_url = BACKUP_DB_URL
+
+    if not primary_url and not fallback_url:
+        print("[DB] No database configured – running in-memory only")
         return
+
+    # Try primary
+    primary_ok = False
+    if primary_url:
+        try:
+            db_pool = await connect_db(primary_url)
+            primary_ok = True
+            print(f"[DB] Connected to primary database")
+        except Exception as e:
+            print(f"[DB] Primary connection failed: {e}")
+
+    # Try fallback if primary failed
+    if not primary_ok and fallback_url:
+        try:
+            db_pool = await connect_db(fallback_url)
+            print(f"[DB] Using fallback database (primary unavailable)")
+        except Exception as e:
+            print(f"[DB] Fallback connection failed: {e}")
+
+    if not db_pool:
+        print("[DB] All databases failed – running in-memory only")
+        return
+
+    # Connect backup pool (best-effort)
+    if fallback_url:
+        try:
+            backup_pool = await connect_db(fallback_url)
+            print(f"[DB] Backup database connected")
+        except Exception as e:
+            print(f"[DB] Backup connection failed: {e}")
+
+    # Load canvas from whichever pool succeeded
     async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS canvas_state (
-                id INTEGER PRIMARY KEY,
-                width INTEGER NOT NULL,
-                height INTEGER NOT NULL,
-                data BYTEA NOT NULL
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS canvas_snapshots (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL DEFAULT '',
-                width INTEGER NOT NULL,
-                height INTEGER NOT NULL,
-                data BYTEA NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
         row = await conn.fetchrow(
             "SELECT width, height, data FROM canvas_state WHERE id = 1")
         if row:
@@ -78,6 +122,22 @@ async def init_db():
                 "VALUES (1, $1, $2, $3)",
                 WIDTH, HEIGHT, bytes(canvas))
             print("[DB] Created new canvas")
+
+
+async def backup_loop():
+    while True:
+        await asyncio.sleep(600)
+        if not backup_pool:
+            continue
+        try:
+            async with backup_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE canvas_state SET width=$1, height=$2, data=$3 "
+                    "WHERE id = 1",
+                    WIDTH, HEIGHT, bytes(canvas))
+            print("[Backup] Canvas saved to backup DB")
+        except Exception as e:
+            print(f"[Backup] Failed: {e}")
 
 
 async def save_pixel(pos, idx):
@@ -634,6 +694,8 @@ app.router.add_get("/ws", websocket_handler)
 
 async def on_startup(app):
     await init_db()
+    if backup_pool:
+        asyncio.create_task(backup_loop())
 
 app.on_startup.append(on_startup)
 
